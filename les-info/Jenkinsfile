@@ -1,0 +1,90 @@
+pipeline {
+  agent any
+
+  options {
+    disableConcurrentBuilds()
+    disableResume()
+  }
+
+  environment {
+    TERRAFORM_IMAGE_NAME = "5519/terraform-jenkins-agent:1.1.6"
+  }
+
+  stages {
+    stage("Load IAC Shared Library") {
+      steps {
+        script {
+          configFileProvider([configFile(fileId: "context", targetLocation: "context.json")]) {
+            toolStacksConfig = readJSON(file: "context.json")
+          }
+
+          withCredentials([usernameColonPassword(credentialsId: "${toolStacksConfig.tool_stack.active.id}.source-code-management", variable: "USERPASS")]) {
+            library(
+              identifier: 'helpers@v2.3.1',
+              retriever: modernSCM([$class: "GitSCMSource", remote: "https://${env.USERPASS}@git.bnc.ca/scm/iac/jenkins-shared-libraries.git"])
+            )
+          }
+
+          context.useToolStack('aws')
+          toolStacksId = context.toolStackId()
+          artifactManagementCredentialStoreEntry = "${toolStacksId}.artifact-management"
+          gitCredential = "${toolStacksId}.source-code-management"
+          configPath = "."
+
+          tf = terraform()
+          def docker = container.docker()
+            .setImage(TERRAFORM_IMAGE_NAME)
+            .setRegistry(context.getDockerRegistry("production"))
+            .setRegistryCredentials(context.getToolId("artifact-management"))
+            .setExtraRunArgs('--entrypoint "" -e DOCKER_HOST=\$DOCKER_HOST')
+          tf.setExecutionEnvironment(docker)
+        }
+      }
+    }
+    stage('Initialize Terraform') {
+      steps {
+        script {
+          tf.init(configPath: configPath)
+        }
+      }
+    }
+    stage('Check Terraform Format') {
+      steps {
+        script {
+          tf.checkfmt("-recursive -list -check")
+        }
+      }
+    }
+    stage('Validate Terraform') {
+      steps {
+        script {
+          tf.validate()
+        }
+      }
+    }
+    stage ('Tagging') {
+      steps {
+        script {
+          if (BRANCH_NAME == 'master') {
+            version.gitTag('--no-fail')
+          } else if (isVersionTag()) {
+            echo "Nothing to do, tag exists."
+          } else {
+            version.gitTag('--dry-run')
+          }
+        }
+      }
+    }
+  }
+}
+
+def isVersionTag() {
+    def tag = env.TAG_NAME
+    if (tag == null) {
+        return false
+    }
+
+    def tagMatcher = tag =~ /v\d+\.\d+\.\d+/
+
+    return tagMatcher.matches()
+}

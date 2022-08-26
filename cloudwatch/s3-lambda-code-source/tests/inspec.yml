@@ -1,0 +1,15 @@
+---
+
+name: tests
+title: Tests AWS S3 bucket
+maintainer: Cloud Foundation Team
+copyright: National Bank of Canada
+license: Proprietary, All rights reserved
+summary: Verify that AWS S3 bucket has been well created
+version: 1.0.0
+inspec_version: ">= 4.50"
+depends:
+- name: inspec-aws
+  url: https://github.com/inspec/inspec-aws/archive/v1.74.71.tar.gz
+supports:
+  platform: aws

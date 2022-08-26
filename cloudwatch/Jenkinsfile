@@ -1,0 +1,324 @@
+pipeline {
+    agent any
+    options {
+        timestamps()
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        lock resource: '6157-DEPLOY-TERRAFORM-ROOT-LOG-CLOUDWATCH-TO-SPLUNK-LOCK'
+    }
+    environment {
+        INSPEC_IMAGE_NAME = "5519/inspec-jenkins-agent:2.3.0"
+        TERRAFORM_IMAGE_NAME = "5519/terraform-jenkins-agent:1.2.4"
+    }
+    parameters {
+        choice(name: 'deploymentStage', choices: ['non_production/sandbox', 'non_production/development', 'production/production'], description: 'Defines the environment and stage to be deployed. Default is sandbox.')
+        string(name: 'components', defaultValue: '', description: 'The list of components to be modified. Use the following format: component_x, component_y, component_z')
+        choice(name: 'mode', choices: ['serial', 'parallel'], description: 'Specifies if the action should be executed in serial or parallel for the declared components.')
+        choice(name: 'action', choices: ['create', 'destroy'], description: 'The action to be applied.')
+    }
+
+    stages {
+        stage ("Load IAC Shared Library") {
+            steps {
+                script {
+                    def activeToolStackId
+                    configFileProvider([configFile(fileId: "context", targetLocation: "context.json")]) {
+                        activeToolStackId = readJSON(file: "context.json").tool_stack.active.id
+                    }
+
+                    withCredentials([usernameColonPassword(credentialsId: "${activeToolStackId}.source-code-management", variable: "USERPASS")]) {
+                        library(
+                            identifier: "helpers@v2.3.1",
+                            retriever: modernSCM([
+                                $class: "GitSCMSource",
+                                remote: "https://${env.USERPASS}@git.bnc.ca/scm/iac/jenkins-shared-libraries.git"
+                            ])
+                        )
+                    }
+                    context.useToolStack("aws")
+                }
+            }
+        }
+        stage ("Validate Parameters and Initialize Variables") {
+            steps {
+                script {
+                    def selectedEnvironment = params.deploymentStage.split('/')[0]
+                    if (selectedEnvironment != context.environment()) {
+                        error("Cannot deploy a ${selectedEnvironment} pipeline from a Jenkins ${context.environment()} environment.")
+                    }
+
+                    def selectedStage = params.deploymentStage.split('/')[1]
+                    if (selectedStage != "sandbox" && !isVersionTag()) {
+                        error("The deployment ${params.deploymentStage} can only be triggered from a version tag. Builds from pull requests and branches can be executed on the sandbox stage only.")
+                    }
+                }
+                script {
+                    stageFolder = params.deploymentStage.split('/')[1]
+                    serialComponents = ["s3-lambda-code-source", "s3-bucket-kinesis", "zip-lambda-code", "lambda-cloudwatch-to-splunk", "kinesis-stream", "cloudwatch-subscription"]
+                    excludedComponentsToTest = ["kinesis-stream"]
+                    destroyProtectedComponents = []
+                    parallelComponents = []
+                    allComponents = (params.components) ? params.components.split(',') : serialComponents + parallelComponents
+
+                    def docker = container.docker()
+                        .setImage(TERRAFORM_IMAGE_NAME)
+                        .setRegistry(context.getDockerRegistry("production"))
+                        .setRegistryCredentials(context.getToolId("artifact-management"))
+                        .setExtraRunArgs('--entrypoint "" -e DOCKER_HOST=\$DOCKER_HOST')
+                    data = [:]
+                    allComponents.each {
+                        def tf = terraform()
+                        tf.setExecutionEnvironment(docker)
+                        data.put("${it}", tf)
+                    }
+                }
+            }
+        }
+        stage ("Terraform") {
+            environment {
+                VAULT_ADDR = "${vault.address()}"
+                VAULT_SKIP_VERIFY = false
+                VAULT_TOKEN="${vault.token('40m')}"
+                TF_VAR_tag_environment="${context.environment()}"
+                TF_VAR_tag_application_id="${context.applicationId()}"
+            }
+            stages {
+                stage ("Initialize Terraform") {
+                    steps {
+                        script {
+                            executeTerraformTasks(allComponents, TerraformCommand.Init, "${stageFolder}", Mode.Parallel)
+                        }
+                    }
+                }
+                stage("Check Terraform Format") {
+                    steps {
+                        script {
+                            executeTerraformTasks(allComponents, TerraformCommand.Fmt, "${stageFolder}", Mode.Parallel)
+                        }
+                    }
+                }
+                stage ("Apply Terraform") {
+                    when {
+                        expression{ params.action == "create" }
+                    }
+                    steps {
+                        catchError {
+                            script {
+                                if (params.components == '') {
+                                    executeTerraformTasks(serialComponents, TerraformCommand.Apply, "${stageFolder}", Mode.Serial)
+                                    executeTerraformTasks(parallelComponents, TerraformCommand.Apply, "${stageFolder}", Mode.Parallel)
+                                }
+                                else {
+                                    if (params.mode == 'serial') {
+                                        executeTerraformTasks(allComponents, TerraformCommand.Apply, "${stageFolder}", Mode.Serial)
+                                    }
+                                    else if (params.mode == 'parallel') {
+                                        executeTerraformTasks(allComponents, TerraformCommand.Apply, "${stageFolder}", Mode.Parallel)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                stage ("Output Terraform") {
+                    when {
+                        allOf {
+                            expression{ params.action == "create" }
+                            expression{ currentBuild.result == null || currentBuild.result == "SUCCESS" }
+                        }
+                    }
+                    steps {
+                        catchError {
+                            script {
+                                executeTerraformTasks(filterArray(allComponents, excludedComponentsToTest), TerraformCommand.Output, "${stageFolder}", Mode.Parallel)
+                            }
+                        }
+                    }
+                }
+                stage ("Test Terraform") {
+                     when {
+                        allOf {
+                            expression{ params.action == "create" }
+                            expression{ currentBuild.result == null || currentBuild.result == "SUCCESS" }
+                        }
+                    }
+                    steps {
+                        catchError {
+                            script {
+                                executeInspecTasks(filterArray(allComponents, excludedComponentsToTest), "exec tests --no-create-lockfile -t aws://")
+                            }
+                        }
+                    }
+                }
+                stage ("Destroy Terraform") {
+                   when {
+                        anyOf {
+                            expression{ params.action == "destroy" }
+                            expression{ params.deploymentStage == "non_production/sandbox" }
+                        }
+                    }
+                    steps {
+                        script {
+                            if (params.components == '') {
+                                executeTerraformTasks(reverseArray(filterArray(allComponents, destroyProtectedComponents)), TerraformCommand.Destroy, "${stageFolder}", Mode.Serial)
+                            }
+                            else {
+                                executeTerraformTasks(reverseArray(allComponents), TerraformCommand.Destroy, "${stageFolder}", Mode.Serial)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage ("Tagging") {
+            steps {
+                script {
+                    if (BRANCH_NAME == 'master') {
+                        version.gitTag('--no-fail')
+                    } else if (isVersionTag()) {
+                        echo "Nothing to do, tag exists."
+                    } else {
+                        version.gitTag('--dry-run')
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo "Workspace cleanup."
+            deleteDir()
+        }
+    }
+}
+
+def reverseArray(array) {
+    def reverseArray = []
+    for (int i = array.size() - 1; i >= 0; i--) {
+        reverseArray.add(array[i])
+    }
+    return reverseArray
+}
+
+def filterArray(arrayToFilter, arrayWithValuesToRemove) {
+    def filteredArray = []
+    for (int i = 0; i < arrayToFilter.size(); i++) {
+        if (!contains(arrayWithValuesToRemove, arrayToFilter[i])) {
+            filteredArray.add(arrayToFilter[i])
+        }
+    }
+    return filteredArray
+}
+
+def contains(array, valueToFind) {
+    for (int i = 0; i < array.size(); i++) {
+        if (array[i] == valueToFind) {
+            return true
+        }
+    }
+    return false
+}
+
+enum TerraformCommand {
+    Apply,
+    Destroy,
+    Fmt,
+    Init,
+    Output,
+    Plan
+}
+
+enum Mode {
+    Parallel,
+    Serial
+}
+
+def executeTerraformTasks(components, command, stageName, mode) {
+    switch (mode) {
+        case Mode.Parallel:
+            def tasks = [:]
+            components.each { componentName ->
+                tasks["${componentName}"] = {
+                    stage ("${componentName}") {
+                        terraform(command, "${componentName}", "${stageName}")
+                    }
+                }
+            }
+            script {
+                parallel tasks
+            }
+            break
+        case Mode.Serial:
+            components.each { component ->
+                script {
+                    stage ("${component}") {
+                        terraform(command, "${component}", "${stageName}")
+                    }
+                }
+            }
+            break
+        default:
+            throw new Exception("The mode ${mode} is not recognized.")
+    }
+}
+
+def terraform(command, component, stageName) {
+    def tf = data.get("${component}")
+
+    switch (command) {
+        case TerraformCommand.Init:
+            tf.init(workingDirectory: "${component}", stage: "${stageName}", subStage: "")
+            break
+        case TerraformCommand.Fmt:
+            tf.checkfmt("-recursive -list -check")
+            break
+        case TerraformCommand.Plan:
+            tf.plan("-refresh-only")
+            break
+        case TerraformCommand.Apply:
+            tf.apply()
+            break
+        case TerraformCommand.Output:
+            tf.output("--json > ./tests/files/terraform-outputs.json")
+            break
+        case TerraformCommand.Destroy:
+            tf.destroy()
+            break
+        default:
+            throw new Exception("The Terraform command ${command} is not recognized.")
+    }
+}
+
+def executeInspecTasks(components, command) {
+    def tasks = [:]
+    components.each { component ->
+        tasks["${component}"] = {
+            stage ("${component}") {
+                def outputs = readJSON(text: data.get("${component}").output("-json"))
+                container.inside(INSPEC_IMAGE_NAME, '--entrypoint "" -u root -e DOCKER_HOST=\$DOCKER_HOST', context.getDockerRegistry("production")) {
+                    credentials.aws().load {
+                        sh """
+                            export AWS_REGION=${outputs.aws_region.value}
+                            cd ${component}
+                            inspec ${command}
+                        """
+                    }
+                }
+            }
+        }
+    }
+    script {
+        parallel tasks
+    }
+}
+
+def isVersionTag() {
+    def tag = env.TAG_NAME
+    if (tag == null) {
+        return false
+    }
+
+    def tagMatcher = tag =~ /v\d+\.\d+\.\d+/
+
+    return tagMatcher.matches()
+}

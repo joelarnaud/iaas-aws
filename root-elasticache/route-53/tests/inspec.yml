@@ -1,0 +1,13 @@
+name: tests-aws-elasticache-route-53
+title: Tests for AWS ElastiCache Route 53
+maintainer: Cloud Foundation Team
+copyright: National Bank of Canada
+license: Proprietary, All rights reserved
+summary: Verify that the Route 53 record for the ElastiCache Redis cluster has been well created
+version: 1.0.0
+inspec_version: ">= 4.50"
+depends:
+  - name: inspec-aws
+    url: https://github.com/inspec/inspec-aws/archive/v1.74.71.tar.gz
+supports:
+  - platform: aws
